@@ -34,6 +34,7 @@ class SubprocessRunner
       [pid, out.first, err.first]
     end
     yield(pid) if block_given?
+    captured_output = []
     [stdout, stderr].reject(&:nil?).each do |stream|
       Thread.new do
         loop do
@@ -44,10 +45,12 @@ class SubprocessRunner
             else
               no_prefix ? output.chomp : "#{datetime} | #{origin} | #{output.chomp}"
             end
-          unless buffer.nil?
+          if buffer.nil?
+            captured_output.push output
+          else
             buffer[:filters].each { |filter| filter.call(formatted_output) }
             buffer[:mutex].synchronize do # Synchronize with the reading thread to avoid mismatched indices when truncating, etc.
-              buffer[:data].push formatted_output
+              buffer.push formatted_output
             end
           end
           log formatted_output # Ensure this is after filters to avoid NWI's lack of color code resets
@@ -56,7 +59,7 @@ class SubprocessRunner
         end
       end
     end
-    pid, process_status = Process.wait2
+    pid, process_status = Process.wait2(pid)
 
     log "Checking exit status"
     status, message = if process_status.exitstatus
@@ -72,10 +75,10 @@ class SubprocessRunner
 
     log "Exit status/message: #{status} - #{message}"
 
-    unless buffer.nil?
-      buffer.synchronize do # Synchronize with the reading thread to avoid mismatched indices when truncating, etc.
-        num_truncated = buffer.truncate
-        log "Truncated #{num_truncated} lines from buffer"
+    if buffer.nil?
+      captured_output.join("\n")
+    else
+      buffer.synchronize do
         buffer[:status] = status unless ignore_status
         buffer[:message] = message unless ignore_message
       end

@@ -48,6 +48,8 @@ It can also be used to remotely monitor and administer servers via RCON.
     - Server log
     - RCON console
     - RCON log
+  - **Server Status page**
+    - Read-only listing of running servers with their metadata and players
 - Extra tools
   - **Remote Monitor Tool**
     - Allows monitoring and administration of servers when provided with valid IP, Query Port, RCON Port, and RCON Password
@@ -69,20 +71,30 @@ It can also be used to remotely monitor and administer servers via RCON.
     - User roles:
       - `Host`: Server host; can configure webserver, users, and everything else
       - `Admin`: Server admin; can do everything except configure the webserver and users
-      - `User`: Currently unused; this will eventually be a read-only role that can access a server status page with player list
+      - `User`: Read-only role which can access basic account features and the server status page
     - New users have a random password automatically generated; this (along with the user name) is given to the user by the host. Upon first login, users are asked to change their password. This helps keep passwords private.
+  - **Log page**
+    - Shows live user authentication and incoming request information
 - User features
   - **Change password**
   - **Log out**
 - Command-line parameters
   - `admin-interface/lib/webapp.rb` supports the following command-line parameter(s)
-    - `--start 'My Server'` - Starts a server on boot with the `My Server` configuration. This can be used in combination with system startup scripts (e.g. systemd unit example in `extras/systemd`) to run your server(s) on boot. Use multiple `--start` parameters to start multiple servers.
+    - `--start/-s [server_config]`
+      - Example: `-s 'My Server'`
+      - Starts a server on boot with the `My Server` configuration. This can be used in combination with system startup scripts (e.g. systemd unit example in `extras/systemd`) to run your server(s) on boot. Use multiple `--start`/`-s` parameters to start multiple servers.
+    - `--log-level/-l [log_level]`
+      - Example: `-l debug`
+      - Sets the log level. Only messages at or above the set level are printed to STDOUT; all logs are still written to `admin-interface/log/sandstorm-admin-wrapper.log`. One of: `debug`, `info`, `warn`, `error`, `fatal`
 
 ### Prerequisites
 
 - Windows (10 tested) or Linux (Debian 9 tested)
 - A Ruby `2.6.3`+ (check with `ruby -v`) installation with the Bundler gem (`gem install bundler`). I recommend [rbenv](https://github.com/rbenv/rbenv) to manage Ruby installations on Linux and [RubyInstaller for Windows](https://rubyinstaller.org/downloads/) to install Ruby on Windows.
 - If using this tool to run a server, grab a portable version of [SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD#Cross-Platform_Installation) (we'll extract it to `sandstorm-admin-wrapper/steamcmd/installation`)
+- Ensure the Insurgency: Sandstorm server prerequisites are installed (Windows):
+  - Visual C++ 2015 Redistributable: https://www.microsoft.com/en-us/download/details.aspx?id=53587
+  - Visual C++ 2017 Redistributable: https://aka.ms/vs/15/release/vc_redist.x64.exe
 
 ### Installation
 

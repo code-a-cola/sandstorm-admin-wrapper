@@ -4,13 +4,14 @@ require 'pry'
 require 'cgi'
 require 'net/http'
 require 'openssl'
-require 'shellwords'
 require 'sinatra/base'
+require 'socket'
 require 'sys/proctable'
 require 'sysrandom'
 require 'toml-rb'
 require 'webrick'
 require 'webrick/https'
+require_relative '../ext/thread'
 require_relative 'logger'
 require_relative 'buffer'
 require_relative 'certificate-generator'
@@ -18,10 +19,11 @@ require_relative 'daemon'
 require_relative 'config-handler'
 require_relative 'user'
 require_relative 'rcon-client'
+require_relative 'self-updater'
 require_relative 'server-updater'
 
 Encoding.default_external = "UTF-8"
-
+LOGGER.threshold :info # Changes STDOUT only
 log "Loading config"
 $config_handler = ConfigHandler.new
 
@@ -34,17 +36,30 @@ class SandstormAdminWrapperSite < Sinatra::Base
     @@monitors = {}
     @@buffers = {}
     @@buffer_mutex = Mutex.new
+    @@wrapper_user_log = create_buffer.last
+    @@wrapper_connection_log = create_buffer.last
     @@rcon_client = RconClient.new
     @@server_updater = ServerUpdater.new(SERVER_ROOT, STEAMCMD_EXE, STEAM_APPINFO_VDF)
-    $config_handler.init_server_config_files
     @@update_thread = nil
     @@prereqs_complete = false
-    init_startup_daemons unless ARGV.empty?
+    @@lan_access_bind_ip = Socket.ip_address_list.detect{ |intf| intf.ipv4_private? }.ip_address rescue '?'
+    @@loaded_wrapper_version = @@config['wrapper_version']
+    handle_arguments unless ARGV.empty?
+    trap 'EXIT' do
+      Thread.new do
+        if @@daemons.any?
+          log "Stopping daemons", level: :info
+          @@daemons.each { |_, daemon| daemon.do_stop_server }
+        end
+      end.join
+    end
   end
 
-  def self.load_webapp_config(config_file = WEBAPP_CONFIG)
-    config = TomlRB.load_file config_file
-    config['automatic_updates'] ||= true
+  def self.load_webapp_config
+    FileUtils.cp(WEBAPP_CONFIG_SAMPLE, WEBAPP_CONFIG) unless File.exist?(WEBAPP_CONFIG)
+    log "Loading wrapper config from #{File.basename WEBAPP_CONFIG}"
+    config = TomlRB.load_file WEBAPP_CONFIG
+    config['automatic_updates'] = true if config['automatic_updates'].nil?
     config
   rescue => e
     log "Couldn't load config from #{config_file}", e
@@ -52,24 +67,35 @@ class SandstormAdminWrapperSite < Sinatra::Base
   end
 
   def self.save_webapp_config(config, config_file = WEBAPP_CONFIG)
+    log "Saving wrapper config"
     File.write(config_file, TomlRB.dump(config))
   end
 
-  def self.init_startup_daemons
+  def self.handle_arguments
     args = ARGV.dup
     while true
       arg = args.shift
       break if arg.nil?
       case arg
-      when '--start'
+      when '--start', '-s'
         val = args.shift
         break if val.nil?
-        config = $config_handler.server_configs[val]
-        if config
-          log "Starting daemon for #{val}", level: :info
-          init_daemon(config, start: true)
+        @@daemons_mutex.synchronize do
+          config = $config_handler.server_configs[val]
+          if config
+            log "Starting daemon for #{val}", level: :info
+            Thread.new { init_daemon(config.dup, start: true) }
+          else
+            log "Unknown server config: #{val}", level: :warn
+          end
+        end
+      when '--log-level', '-l'
+        val = args.shift.to_s.upcase.to_sym
+        if Logger::Severity.constants.include? val
+          log "Setting STDOUT logger threshold to #{val}", level: :info
+          LOGGER.threshold val
         else
-          log "Unknown server config: #{val}", level: :warn
+          log "Unknown log level: #{val}. Try one of these: #{Logger::Severity.constants.map(&:to_s).join(', ')}", level: :warn
         end
       else
         log "Unknown argument: #{arg}", level: :warn
@@ -77,17 +103,19 @@ class SandstormAdminWrapperSite < Sinatra::Base
     end
   end
 
-  def self.init_daemon(config=$config_handler.config.dup, start: false)
+  def self.init_daemon(config, start: false)
     key = config['server_game_port']
-    log "Initializing daemon with game port [#{key}]", level: :info
-    @@daemons[key] = SandstormServerDaemon.new(
-      config,
-      @@daemons,
-      @@daemons_mutex,
-      @@rcon_client,
-      create_buffer.last,
-      create_buffer.last
-    )
+    @@daemons_mutex.synchronize do
+      log "Initializing daemon with game port [#{key}]", level: :info
+      @@daemons[key] = SandstormServerDaemon.new(
+        config,
+        @@daemons,
+        @@daemons_mutex,
+        @@rcon_client,
+        create_buffer.last,
+        create_buffer.last
+      )
+    end
     @@daemons[key].do_start_server if start
     @@daemons[key]
   end
@@ -138,7 +166,7 @@ class SandstormAdminWrapperSite < Sinatra::Base
     steamcmd_path = steamcmd_installed?
     game_server_path = game_server_installed?
     @@prereqs_complete = steamcmd_path && game_server_path
-    @@update_thread = get_game_update_thread if @@prereqs_complete && @@update_thread.nil?
+    @@update_thread = get_game_update_thread if @@prereqs_complete && @@update_thread.nil? && @@config['automatic_updates']
     return [steamcmd_path, game_server_path]
   end
 
@@ -148,34 +176,34 @@ class SandstormAdminWrapperSite < Sinatra::Base
 
   def install_server(buffer=nil, validate: nil)
     log "Installing server..."
-    @@server_updater.update_server(buffer, validate: validate)
+    success, message = @@server_updater.update_server(buffer, validate: validate)
+    message
   end
 
   def update_server(buffer=nil, validate: nil)
     was_running = []
-    @@daemons_mutex.synchronize do
-      if WINDOWS
-        @@daemons.each do |key, daemon|
-          if daemon.server_running?
-            daemon.do_pre_update_warning
-            daemon.do_stop_server
-            was_running << key
-          end
-        end
-      end
-      success, message = @@server_updater.update_server(buffer, validate: validate)
-      @update_pending = false if success
+    if WINDOWS
       @@daemons.each do |key, daemon|
-        next unless was_running.include?(key)
-        if WINDOWS
-          daemon.do_start_server
-        else
+        if daemon.server_running?
           daemon.do_pre_update_warning
-          daemon.do_restart_server
+          daemon.do_stop_server
+          was_running << key
         end
       end
-      message
     end
+    success, message = @@server_updater.update_server(buffer, validate: validate)
+    @update_pending = !success
+    @@daemons.each do |key, daemon|
+      if WINDOWS
+        next unless was_running.include?(key)
+        daemon.do_start_server
+      else
+        next unless daemon.server_running?
+        daemon.do_pre_update_warning
+        daemon.do_restart_server
+      end
+    end
+    message
   end
 
   def run_steamcmd(command, buffer: nil)
@@ -196,12 +224,12 @@ class SandstormAdminWrapperSite < Sinatra::Base
 
   def start_updates
     if @@update_thread
-      log "Restarting updates"
+      log "Restarting updates", level: :info
       @@update_thread.kill
       @@update_thread = get_game_update_thread
       "Automated updates restarted"
     else
-      log "Starting updates"
+      log "Starting updates", level: :info
       @@update_thread = get_game_update_thread
       "Automated updates started"
     end
@@ -218,13 +246,26 @@ class SandstormAdminWrapperSite < Sinatra::Base
     end
   end
 
+  def zip_logs(zip_path, glob)
+    log "Zipping logs from #{glob} into #{zip_path.sub(USER_HOME, '~')}"
+    files_to_zip = Dir.glob(glob).map { |f| File.expand_path f }
+    Zip::File.open(zip_path, Zip::File::CREATE) do |zipfile|
+      files_to_zip.each do |f|
+        log "Zipping #{f.sub(USER_HOME, '~')}"
+        zipfile.add(File.basename(f), f)
+      end
+    end
+  end
+
   set_up
 
   configure do
-    working_directory = File.join File.dirname(__FILE__), '..', 'docroot'
+    working_directory = File.expand_path File.join File.dirname(__FILE__), '..', 'docroot'
     log "Setting webserver root dir to: #{working_directory.sub(USER_HOME, '~')}", level: :info
     set :root, working_directory
-    enable :sessions, :logging, :dump_errors, :raise_errors, :show_exceptions
+    enable :sessions, :dump_errors #, :raise_errors, :show_exceptions #, :logging
+    set :raise_errors, false
+    set :show_exceptions, false
     set :session_secret, @@config['admin_interface_session_secret'] unless @@config['admin_interface_session_secret'].empty?
   end
 
@@ -234,7 +275,9 @@ class SandstormAdminWrapperSite < Sinatra::Base
       condition do
         begin
           unless has_role?(role)
-            log "#{request.ip} | User unauthorized: '#{session[:user_id]}' requesting #{role}-privileged content", level: :warn
+            message = "IP: #{request.ip} | User unauthorized: #{"'#{@user.name}' [#{@user.role}] (#{session[:user_id]})" rescue '[logged out]'} requesting #{role}-privileged content: #{request.path_info}"
+            @@wrapper_user_log << "#{datetime} | #{message}"
+            log message, level: :warn
             status 403
             redirect "/login#{CGI.escape(request.path_info) unless request.path_info.casecmp('/').zero?}" if request.request_method == 'GET'
             error = "403 Unauthorized - You don't have permission to do this."
@@ -265,15 +308,34 @@ class SandstormAdminWrapperSite < Sinatra::Base
     end
 
     def is_host?
-      has_role(:host)
+      has_role?(:host)
     end
 
     def is_admin?
-      has_role(:admin)
+      has_role?(:admin)
     end
 
     def is_user?
-      has_role(:user)
+      has_role?(:user)
+    end
+
+    def get_active_config
+      active_config = (@@daemons.values.select{ |d| d.buffer[:uuid] == session[:active_daemon_uuid]}.first.config rescue nil) ||
+          $config_handler.server_configs[session[:active_server_config]] ||
+          (@@daemons.values.select { |d| d.config['server-config-name'] == session[:active_server_config] }.first.config rescue nil) ||
+          $config_handler.server_configs.values.last
+      log "Got active server config with name #{active_config['server-config-name']} (game port #{active_config['server_game_port']})"
+      active_config
+    end
+  end
+
+  error do
+    e = env['sinatra.error']
+    log "#{request.ip} | Error occurred in route #{request.path}", e
+    if is_host?
+      "(#{e.class}) #{e.message} | Backtrace:<br>#{e.backtrace.join('<br>')}"
+    else
+      "An error occurred (#{e.class}). Please view the logs or contact the maintainer."
     end
   end
 
@@ -281,14 +343,16 @@ class SandstormAdminWrapperSite < Sinatra::Base
     env['rack.logger'] = LOGGER
     env['rack.errors'] = LOGGER
     @user = $config_handler.users[session[:user_id]] if session[:user_id]
-    # log "Redirecting unauthenticated user to login"
-    # redirect "/login/#{CGI.escape request.path_info}" if @user.nil? && !(request.path_info.start_with? '/login')
     check_prereqs unless @@prereqs_complete
     request.body.rewind
-    body = request.body.read
-    request.body.rewind # Be kind
-    # message = "Request: #{request.request_method}#{' ' << request.script_name unless request.script_name.strip.empty? } #{request.path_info}#{'?' << request.query_string unless request.query_string.strip.empty?} from #{request.ip}#{(' | Body: ' << body) unless body.strip.empty?}"
-    # log message
+    # body = request.body.read
+    # request.body.rewind # Be kind
+    timestamp = datetime
+    message = "IP: #{request.ip} | #{"User: #{@user.name} | " if @user}Request: #{request.request_method}#{' ' << request.script_name unless request.script_name.strip.empty? } #{request.path_info}#{'?' << request.query_string unless request.query_string.strip.empty?}" # #{(' | Body: ' << body) unless body.strip.empty?}"
+    log message
+    @@wrapper_user_log.push "#{timestamp} | #{message}" if request.request_method != 'GET'
+    @@wrapper_connection_log.push "#{timestamp} | #{message} | Agent: #{request.user_agent}"
+    nil
   end
 
   # after do
@@ -325,7 +389,9 @@ class SandstormAdminWrapperSite < Sinatra::Base
     if user && password
       known_user = $config_handler.users.values.select { |u| u.name == user }.first
       if known_user && known_user.password == password # BCrypt::Password == string comparison
-        log "#{request.ip} | Logged in as #{known_user.name}", level: :info
+        message = "IP: #{request.ip} | #{known_user.name} [#{known_user.role}] logged in (#{known_user.id})"
+        log message, level: :info
+        @@wrapper_user_log << "#{datetime} | #{message}"
         session[:user_id] = known_user.id
         return known_user.first_login? ? "/change-password#{destination}" : destination
       end
@@ -335,14 +401,38 @@ class SandstormAdminWrapperSite < Sinatra::Base
   end
 
   get '/logout' do
+    user = $config_handler.users[session[:user_id]]
+    halt 400, 'Not logged in' if user.nil?
+    message = "IP: #{request.ip} | #{user.name} [#{user.role}] logged out (#{user.id})"
+    log message, level: :info
+    @@wrapper_user_log << "#{datetime} | #{message}"
     session[:user_id] = nil
     redirect '/login'
+  end
+
+  get '/status', auth: :user do
+    @daemons = @@daemons
+    @monitors = @@monitors
+    erb :'server-status', layout: :'layout-main' do
+      erb :'server-list'
+    end
+  end
+
+  get '/server-list', auth: :user do
+    @daemons = @@daemons
+    @monitors = @@monitors
+    erb :'server-list'
+  end
+
+  get '/server-daemons', auth: :admin do
+    @daemons = @@daemons
+    erb :'server-daemons', layout: :'layout-main'
   end
 
   get '/change-password(/:destination)?', auth: :user do
     @destination = "/#{params['destination']}".sub('/change-password', '')
     @first_login = !@user.initial_password.nil?
-    erb :'change-password'
+    erb :'change-password', layout: :'layout-main'
   end
 
   post '/change-password', auth: :user do
@@ -355,11 +445,20 @@ class SandstormAdminWrapperSite < Sinatra::Base
       return "Invalid password. The password must be new and not blank!"
     end
     @user.password = password
+    $config_handler.write_user_config
     destination
+  end
+
+  get '/wrapper-log', auth: :host do
+    @user_log_id = @@wrapper_user_log[:uuid]
+    @conn_log_id = @@wrapper_connection_log[:uuid]
+    erb :'wrapper-log', layout: :'layout-main'
   end
 
   get '/wrapper-config', auth: :host do
     @config = @@config
+    @lan_access_bind_ip = @@lan_access_bind_ip
+    @wrapper_version = @@loaded_wrapper_version
     erb :'wrapper-config', layout: :'layout-main'
   end
 
@@ -483,15 +582,17 @@ class SandstormAdminWrapperSite < Sinatra::Base
 
   get '/pry', auth: :host do
     @buffers = @@buffers
+    prev_threshold = LOGGER.threshold
     Thread.new do
       LOGGER.threshold :fatal # Turn down STDOUT logging
-      `stty echo` unless WINDOWS # Ensure we have echoing enabled; something from logging turns them off...
+      `stty echo` unless WINDOWS || !$stdout.isatty # Ensure we have echoing enabled; something from logging turns it off...
 
       # Stuff
 
       binding.pry
     ensure
-      LOGGER.threshold :debug
+      `stty echo` unless WINDOWS || !$stdout.isatty
+      LOGGER.threshold prev_threshold
     end.join
     nil
   rescue Interrupt
@@ -499,18 +600,13 @@ class SandstormAdminWrapperSite < Sinatra::Base
 
   get '/threads/:game_port', auth: :user do
     daemon = @@daemons[params[:game_port]]
-    pid = daemon.game_pid if daemon
-    process = Sys::ProcTable.ps(pid: pid) if pid
+    @pid = daemon.game_pid if daemon
+    process = Sys::ProcTable.ps(pid: @pid) if @pid
     threads = (WINDOWS ? process.thread_count : process.nlwp) if process
-    threads = threads || 0
-    @monitor = daemon.monitor rescue nil
-    @info = @monitor.info rescue nil
-    <<~HERE
-      <div style="white-space: pre;">PID: <span id="game-port">#{pid}</span></div>
-      <div style="white-space: pre;">Threads: <span id="game-port">#{threads}</span></div>
-      <div style="white-space: pre;">Players: <span id="rcon-port">#{@info[:rcon_players].size rescue 0}</span></div>
-      <div style="white-space: pre;">Bots: <span id="rcon-port">#{@info[:rcon_bots].size rescue 0}</span></div>
-    HERE
+    @threads = threads || 0
+    monitor = daemon.monitor rescue nil
+    @info = monitor.info rescue nil
+    erb :threads
   end
 
   get '/players/:game_port', auth: :user do
@@ -526,26 +622,41 @@ class SandstormAdminWrapperSite < Sinatra::Base
   end
 
   post '/restart-wrapper', auth: :host do
-    @@daemons_mutex.synchronize do
-      @@daemons.each { |_, daemon| daemon.do_stop_server }
-      ENV['HOME'] = USER_HOME
-      # The below exec doesn't work on Windows (port conflict?), so we'll exit with a particular code instead, to be handled by the start script
-      if WINDOWS
-        at_exit do
-          exit 2
-        end
-        Thread.new { sleep 0.2; log "Replacing the current process..."; exit }
-      else
-        Thread.new { sleep 0.2; log "Replacing the current process..."; exec 'bundle', 'exec', 'ruby', $PROGRAM_NAME, *ARGV }
+    @@daemons.each { |_, daemon| daemon.do_stop_server }
+    ENV['HOME'] = USER_HOME
+    # The below exec doesn't work on Windows (port conflict?), so we'll exit with a particular code instead, to be handled by the start script
+    if WINDOWS
+      at_exit do
+        exit 2
       end
-      ''
+      Thread.new { sleep 0.2; log "Replacing the current process..."; exit }
+    else
+      # If we changed gems in an update, try to install them
+      output = `bundle`
+      puts output
+      Thread.new { sleep 0.2; log "Replacing the current process..."; exec 'bundle', 'exec', 'ruby', $PROGRAM_NAME, *ARGV }
     end
+    ''
+  end
+
+  post '/update-wrapper', auth: :host do
+    version = SelfUpdater.update_to_latest
+    @@config['wrapper_version'] = version
+    self.class.save_webapp_config @@config
+    "Updated to #{version}! Restart the wrapper to apply."
+  rescue => e
+    status 500
+    e.message
   end
 
   get '/', auth: :user do
     @steamcmd_path, @game_server_path = check_prereqs
-    redirect '/setup' unless @steamcmd_path && @game_server_path
-    redirect '/control'
+    if is_admin?
+      redirect '/setup' unless @steamcmd_path && @game_server_path
+      redirect '/control'
+    else
+      redirect '/status'
+    end
   end
 
   get '/about', auth: :user do
@@ -560,8 +671,14 @@ class SandstormAdminWrapperSite < Sinatra::Base
 
   get '/config', auth: :admin do
     redirect '/setup' unless @@prereqs_complete
-    @config = $config_handler.config.dup
-    config_name = @config['server-config-name']
+    config = get_active_config
+    config_name = config['server-config-name']
+    @config = $config_handler.server_configs[config_name] || $config_handler.server_configs.first
+    if config_name.to_s.empty?
+      status 400
+      return "Unknown config"
+    end
+    $config_handler.init_server_config_files config_name
     @game_ini = ERB.new(CONFIG_FILES[:game_ini][:local_erb]).result(binding)
     @engine_ini = ERB.new(CONFIG_FILES[:engine_ini][:local_erb]).result(binding)
     @admins_txt = ERB.new(CONFIG_FILES[:admins_txt][:local_erb]).result(binding)
@@ -572,21 +689,28 @@ class SandstormAdminWrapperSite < Sinatra::Base
 
   get '/control', auth: :admin do
     redirect '/setup' unless @@prereqs_complete
-    @config = $config_handler.config
-    @game_port = @config['server_game_port']
-    @rcon_port = @config['server_rcon_port']
-    @query_port = @config['server_query_port']
-    daemon = @@daemons[@game_port]
-    @server_status = get_server_status(@game_port)
-    erb(:'server-control', layout: :'layout-main') do
-      @monitor = daemon.monitor rescue nil
-      @info = @monitor.info rescue nil
-      erb :players
+    @config = get_active_config
+    daemon = @@daemons[@config['server_game_port']] || @@daemons.values.select { |d| d.config['server-config-name'] == session[:active_server_config] }.first
+    if daemon
+      log "/control working with daemon name #{daemon.config['server-config-name']} (active game port #{daemon.active_game_port})"
+    else
+      log "/control Failed to get running daemon for config with name #{@config['server-config-name']} (game port #{@config['server_game_port']})"
     end
+    @game_port = daemon.server_running? ? daemon.active_game_port : @config['server_game_port'] rescue @config['server_game_port']
+    @rcon_port = daemon.server_running? ? daemon.active_rcon_port : @config['server_rcon_port'] rescue @config['server_rcon_port']
+    @query_port = daemon.server_running? ? daemon.active_query_port : @config['server_query_port'] rescue @config['server_query_port']
+    @server_status = get_server_status(@game_port)
+    @pid = daemon.game_pid if daemon
+    process = Sys::ProcTable.ps(pid: @pid) if @pid
+    threads = (WINDOWS ? process.thread_count : process.nlwp) if process
+    @threads = threads || 0
+    @monitor = daemon.monitor rescue nil
+    @info = @monitor.info rescue nil
+    erb(:'server-control', layout: :'layout-main')
   end
 
   get '/tools/:resource', auth: :admin do
-    @config = $config_handler.config.dup
+    @config = get_active_config
     resource = params['resource']
     case resource
     when 'rcon'
@@ -619,7 +743,28 @@ class SandstormAdminWrapperSite < Sinatra::Base
     end
   end
 
-  get '/server-status/:game_port', auth: :admin do
+  get '/server-control-status' do
+    @config = get_active_config
+    daemon = @@daemons[@config['server_game_port']] || @@daemons.values.select { |d| d.config['server-config-name'] == session[:active_server_config] }.first
+    if daemon
+      log "/server-control-status working with daemon name #{daemon.config['server-config-name']} (active game port #{daemon.active_game_port})"
+    else
+      log "/server-control-status Failed to get running daemon for config with name #{@config['server-config-name']} (game port #{@config['server_game_port']})"
+    end
+    @game_port = daemon.server_running? ? daemon.active_game_port : @config['server_game_port'] rescue @config['server_game_port']
+    @rcon_port = daemon.server_running? ? daemon.active_rcon_port : @config['server_rcon_port'] rescue @config['server_rcon_port']
+    @query_port = daemon.server_running? ? daemon.active_query_port : @config['server_query_port'] rescue @config['server_query_port']
+    @server_status = get_server_status(@game_port)
+    @pid = daemon.game_pid if daemon
+    process = Sys::ProcTable.ps(pid: @pid) if @pid
+    threads = (WINDOWS ? process.thread_count : process.nlwp) if process
+    @threads = threads || 0
+    @monitor = daemon.monitor rescue nil
+    @info = @monitor.info rescue nil
+    erb :'server-control-status'
+  end
+
+  get '/server-status/:game_port', auth: :user do
     game_port = params[:game_port]
     get_server_status(game_port)
   end
@@ -632,14 +777,16 @@ class SandstormAdminWrapperSite < Sinatra::Base
     end
     buffer = @@buffers[uuid]
     @bookmark_uuid = params['bookmark']
-    limit = 500
+    limit = buffer[:limit]
 
     buffer[:mutex].synchronize do # Synchronize with the writing thread to avoid mismatched indices when truncating, etc.
       buffer[:iterator] = buffer[:iterator].nil? ? 1 : buffer[:iterator] + 1
       # log "Buffer [#{uuid}][#{buffer[:iterator]}] arrived with bookmark: [#{@bookmark_uuid}] -> #{buffer[:bookmarks][@bookmark_uuid]}"
       # log "Buffer [#{uuid}][#{buffer[:iterator]}] Bookmarks: #{buffer[:bookmarks]}"
-      if buffer[:bookmarks].length > 10
-        log "Buffer has many bookmarks! Are that many clients connected? #{buffer}", level: :warn
+      if buffer[:bookmarks].length > 100
+        log "Buffer has many bookmarks! Are that many clients connected? #{buffer[:uuid]} (#{buffer[:bookmarks].length} bookmarks)", level: :warn
+        log "Purging first 20 bookmarks", level: :warn
+        20.times { buffer[:bookmarks].shift }
       end
       unless buffer[:bookmarks].keys.include?(@bookmark_uuid) || @bookmark_uuid.nil?
         status 400
@@ -658,12 +805,12 @@ class SandstormAdminWrapperSite < Sinatra::Base
       end
 
       start_index = buffer[:bookmarks][@bookmark_uuid] || 0
-      start_index = 0 if start_index > buffer[:data].length
+      start_index = 0 if start_index > buffer.size
       # log "Buffer [#{uuid}][#{buffer[:iterator]}] start_index unexpectedly negative" if start_index < 0
       new_bookmark_uuid = Sysrandom.uuid
-      new_bookmark = (buffer[:data].length - start_index > limit) ? (start_index + limit) : buffer[:data].length
+      new_bookmark = (buffer.size - start_index > limit) ? (start_index + limit) : buffer.size
       # log "Buffer - Calculated new_bookmark: #{new_bookmark}"
-      if new_bookmark == buffer[:data].length && !buffer[:status].nil?
+      if new_bookmark == buffer.size && !buffer[:status].nil?
         # Process is done. The next bookmark will be an indicator to send status and message next time
         # as well as slice to the end of the array below
         new_bookmark = -1
@@ -724,16 +871,27 @@ class SandstormAdminWrapperSite < Sinatra::Base
           status 400
           return "Unknown config: #{options[:config_name]}"
         end
-        daemon = if @@daemons[config['server_game_port']].nil?
-          @@daemons[config['server_game_port']] = self.class.init_daemon
+        daemon = if @@daemons[config['server_game_port']].nil? && (@@daemons.values.select { |d| d.name == config['server-config-name'] }.empty? rescue true)
+          @@daemons[config['server_game_port']] = self.class.init_daemon config
         else
-          @@daemons[config['server_game_port']]
+          @@daemons[config['server_game_port']] || @@daemons.values.select { |d| d.name == config['server-config-name']}.first
         end
+        daemon.config.merge!(config)
+        session[:active_daemon_uuid] = daemon.buffer[:uuid]
         daemon.do_start_server
       when 'stop'
-        daemon.do_stop_server
+        body daemon.do_stop_server
+        session[:active_daemon_uuid] = nil if daemon.buffer[:uuid] == session[:active_daemon_uuid]
+      when 'delete'
+        @@daemons.delete(@@daemons.key daemon).implode
       when 'restart'
-        daemon.do_restart_server
+        daemon.config.merge!($config_handler.server_configs[daemon.name]) if $config_handler.server_configs[daemon.name]
+        if daemon.server_running?
+          daemon.do_restart_server
+        else
+          status 400
+          "Server is not running"
+        end
       when 'rcon'
         begin
           Thread.new { daemon.do_send_rcon(options[:command], host: options[:host], port: options[:port], pass: options[:pass], buffer: daemon.rcon_buffer) }
@@ -754,7 +912,8 @@ class SandstormAdminWrapperSite < Sinatra::Base
 
   get '/config/file/:file', auth: :admin do
     config_name = params['config']
-    file = File.join CONFIG_FILES_DIR, config_name.shellescape, params['file'].gsub('..', '')
+    file = params['file'].gsub('..', '')
+    file = File.join CONFIG_FILES_DIR, (file == 'Bans.json' ? '' : config_name), file
     if File.exist? file
       File.read(file)
     else
@@ -768,14 +927,22 @@ class SandstormAdminWrapperSite < Sinatra::Base
     file = params['file']
     content = params['content']
     content << "\n" unless content.end_with? "\n"
-    File.write(File.join(CONFIG_FILES_DIR, config_name.shellescape, file), content)
+    file = File.join(CONFIG_FILES_DIR, config_name, file)
+    FileUtils.mkdir_p(File.dirname(file))
+    File.write(file, content)
     "Wrote #{file.sub(USER_HOME, '~')}."
   end
 
   put '/config/:action', auth: :admin do
     if params['action'] == 'set'
       begin
-        status, msg, current, old = $config_handler.set params['config'], params['variable'], params['value']
+        value = case params['variable']
+        when 'server_mutators'
+          params['value'].split(',')
+        else
+          params['value']
+        end
+        status, msg, current, old = $config_handler.set params['config'], params['variable'], value
         if status
           "Changed #{params['variable']}: #{old} => #{current}"
         else
@@ -809,12 +976,13 @@ class SandstormAdminWrapperSite < Sinatra::Base
 
   get '/daemon/:game_port', auth: :admin do
     daemon = @@daemons[params[:game_port]]
-    if daemon
-      $config_handler.config = daemon.config.dup
-      ''
-    else
+    if daemon.nil?
       status 400
       "Could not find server daemon for game port #{params[:game_port]}"
+    else
+      session[:active_daemon_uuid] = daemon.buffer[:uuid]
+      log "Set active_server_config to daemon config with name #{daemon.config['server-config-name']} (original game port #{daemon.config['server_game_port']})"
+      nil
     end
   end
 
@@ -924,13 +1092,8 @@ class SandstormAdminWrapperSite < Sinatra::Base
       key = "#{ip}:#{rcon_port}"
       @@monitors[key] if @@monitors[key]
     end
-    @info = @monitor.info unless @monitor.nil?
-    if @info.empty?
-      status 400
-      ''
-    else
-      erb :'monitoring-details'
-    end
+    @info = @monitor.info rescue nil
+    erb :'monitoring-details'
   end
 
   post '/admin/:action/:steam_id', auth: :admin do
@@ -941,6 +1104,7 @@ class SandstormAdminWrapperSite < Sinatra::Base
     case params[:action]
     when 'ban'
       uuid, buffer = self.class.create_buffer
+      # Thread.new { @@rcon_client.send(data['ip'], data['port'], data['pass'], "banid #{steam_id}", buffer: buffer) }
       Thread.new { @@rcon_client.send(data['ip'], data['port'], data['pass'], "permban #{steam_id}", buffer: buffer) }
       uuid
     when 'kick'
@@ -969,39 +1133,31 @@ class SandstormAdminWrapperSite < Sinatra::Base
   end
 
   get '/server-config/:name', auth: :admin do
-    if $config_handler.server_configs[params['name']]
-      $config_handler.config = $config_handler.server_configs[params['name']]
-      Oj.dump($config_handler.server_configs[params['name']])
+    config_name = params['name']
+    config = $config_handler.server_configs[config_name]
+    if config
+      log "Set active server config to config with name #{config_name} (game port #{config['server_game_port']})"
+      session[:active_daemon_uuid] = nil
+      session[:active_server_config] = config_name
+      Oj.dump(config)
     else
       status 400
-      "Unknown server config: #{params['name']}"
+      "Unknown server config: #{config_name}"
     end
   end
 
   post '/server-config/:name', auth: :admin do
     overwrote = !$config_handler.server_configs[params['name']].nil?
-    data = Oj.load(request.body.read)
+    settings = Oj.load(request.body.read)
     request.body.rewind
-    $config_handler.server_configs[params['name']] =
-      $config_handler.get_default_config.merge(
-      $config_handler.server_configs[params['name']] || {}).merge(
-      data).merge(
-      {'server-config-name' => params['name']}
-    )
-    $config_handler.write_server_configs(params['name'])
+    $config_handler.create_server_config params['name'], settings
     "#{overwrote ? 'Overwrote' : 'Saved' } #{params['name']}"
   end
 
   delete '/server-config/:name', auth: :admin do
     config_name = params['name']
     if $config_handler.server_configs[config_name]
-      $config_handler.server_configs.delete config_name
-      CONFIG_FILES.values.each do |it|
-        local = ERB.new(it[:local_erb]).result(binding) # relies on config_name
-        FileUtils.rm local
-      end
-      FileUtils.rmdir File.join(CONFIG_FILES_DIR, config_name.shellescape)
-      $config_handler.write_server_configs
+      $config_handler.delete_server_config config_name
       "Deleted #{params['name']}"
     else
       status 400
@@ -1045,6 +1201,30 @@ class SandstormAdminWrapperSite < Sinatra::Base
     end
   end
 
+  get '/generate-password', auth: :admin do
+    ConfigHandler.generate_password
+  end
+
+  get '/download-server-logs(/:config_name)?', auth: :admin do
+    config_name = params['config_name']
+    zip_path = File.expand_path File.join SERVER_LOG_DIR, "#{ConfigHandler.sanitize_directory(config_name) + '-' if config_name}sandstorm-logs-#{DateTime.now.strftime('%Y-%m-%d_%H-%M-%S')}.zip"
+    zip_logs zip_path, File.join(SERVER_LOG_DIR, config_name ? "#{config_name}*.log" : '*.log')
+    begin
+      send_file zip_path, filename: File.basename(zip_path), disposition: :attachment
+    ensure
+      Thread.new { FileUtils.rm zip_path }
+    end
+  end
+
+  get '/download-wrapper-logs', auth: :host do
+    zip_path = File.expand_path File.join WEBAPP_ROOT, 'log', "saw-logs-#{DateTime.now.strftime('%Y-%m-%d_%H-%M-%S')}.zip"
+    zip_logs zip_path, File.join(WEBAPP_ROOT, 'log', '*.log*')
+    begin
+      send_file zip_path, filename: File.basename(zip_path), disposition: :attachment
+    ensure
+      Thread.new { FileUtils.rm zip_path }
+    end
+  end
 end
 
 def get_webrick_options(config = SandstormAdminWrapperSite.load_webapp_config)
@@ -1070,6 +1250,12 @@ def get_webrick_options(config = SandstormAdminWrapperSite.load_webapp_config)
     else
       # Make temporary cert/key, since WEBrick's defaults won't work with modern browsers
       cert, key = CertificateGenerator.generate
+      log "Writing generated certs to file", level: :info
+      config['admin_interface_ssl_cert'] = GENERATED_SSL_CERT
+      config['admin_interface_ssl_key'] = GENERATED_SSL_KEY
+      SandstormAdminWrapperSite.save_webapp_config(config)
+      File.write GENERATED_SSL_CERT, cert
+      File.write GENERATED_SSL_KEY, key
       webrick_options.merge!({
         SSLCertificate: cert,
         SSLPrivateKey: key,
@@ -1088,7 +1274,7 @@ begin
   log "Starting webserver with options: #{options}"
   begin
     $server = Rack::Server.new(options)
-    Thread.new { sleep 1; log "Webserver initialized! Visit: http#{'s' if config['admin_interface_use_ssl']}://127.0.0.1:#{config['admin_interface_bind_port']}", level: :info }
+    Thread.new { sleep 1; log "Webserver initialized! Visit: http#{'s' if config['admin_interface_use_ssl']}://#{config['admin_interface_bind_ip'] == '0.0.0.0' ? '127.0.0.1' : config['admin_interface_bind_ip']}:#{config['admin_interface_bind_port']}", level: :info }
     $server.start
   rescue Exception => e
     raise if e.is_a? StandardError
@@ -1100,4 +1286,5 @@ rescue => e
 ensure
   log "Webserver stopped"
   $config_handler.write_config
+  `stty echo` unless WINDOWS || !$stdout.isatty
 end

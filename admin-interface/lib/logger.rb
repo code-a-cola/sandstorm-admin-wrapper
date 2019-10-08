@@ -26,9 +26,14 @@ class MultiTargetLogger
   Logger::Severity.constants.each do |severity|
     severity = severity.downcase
     define_method(severity) do |*args|
+      # Suppress SSL error for self-generated certificate
+      if args.first.to_s.end_with? ': sslv3 alert certificate unknown'
+        severity = :debug
+        args[0] = args.first.to_s
+      end
       @loggers.each { |_, logger| logger.send(severity, *args) if Logger.const_get(severity.to_s.upcase) >= logger.level }
       if args.first.is_a? Exception
-        @loggers.each { |_, logger| logger.send(severity, "Backtrace:#{args.first.backtrace.join("\n  ").prepend("\n  ")}") if Logger.const_get(severity.to_s.upcase) >= logger.level }
+        @loggers.each { |_, logger| logger.send(:error, "Backtrace:#{args.first.backtrace.join("\n  ").prepend("\n  ")}") if Logger.const_get(severity.to_s.upcase) >= logger.level }
       end
 
       nil
@@ -72,11 +77,12 @@ def datetime # Helper function used elsewhere
   Time.now.strftime(DATETIME_FORMAT)
 end
 
-def log(message, exception=nil, level: :debug)
+def log(message, exception=nil, level: nil)
   unless exception.nil?
     message = message + " | Exception occurred (#{exception.class}): #{exception.message}\n  #{exception.backtrace.to_a.map { |l| l.sub USER_HOME, '~'}.join("\n  ")}"
-    level = :error if level == :debug
+    level ||= :error
   end
+  level ||= :debug
   LOGGER.log level, message
 end
 

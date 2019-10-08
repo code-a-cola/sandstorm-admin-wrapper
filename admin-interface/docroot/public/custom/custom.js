@@ -1,9 +1,9 @@
-// var touchDevice = (navigator.maxTouchPoints || 'ontouchstart' in document.documentElement);
-// if (touchDevice) {
-//   var tooltipTrigger = 'hover click'
-// } else {
-//   var tooltipTrigger = 'hover'
-// }
+var touchDevice = (navigator.maxTouchPoints || 'ontouchstart' in document.documentElement);
+if (touchDevice) {
+  var tooltipTrigger = 'hover click'
+} else {
+  var tooltipTrigger = 'hover'
+}
 
 // var user_scrolled_tailing_log = false;
 var server_log_active = false;
@@ -12,7 +12,7 @@ var server_rcon_log_active = false;
 var rcon_log_uuid = null;
 
 var log_buffer_size = 500;
-var server_log_tail_interval = 500;
+var server_log_tail_interval = 1000;
 var server_status_interval = 1000;
 
 var updatePlayersInterval = null;
@@ -23,7 +23,9 @@ var tailBufferUuids = [];
 var tailBufferStopUuids = [];
 
 $(document).ready(function() {
-//   $("body").tooltip({ selector: '[data-toggle=tooltip]', trigger : tooltipTrigger });
+  $(() => {
+    $('[data-toggle="tooltip"]').tooltip({ trigger : tooltipTrigger, container : 'body' })
+  });
 
   // TO DO - abstract to all log elements; use element attribute to track scrolled state
   // if ($('#tailing-log').length) {
@@ -35,8 +37,8 @@ $(document).ready(function() {
   //   });
   // }
 
-  if ($('#server-configs').length) {
-    setTimeout(()=>{ loadServerConfigs('#server-configs'); }, 0);
+  if ($('#server-control-status').length) {
+    setTimeout(()=>{ updateServerControlStatus(); }, 0); // Recursive
   }
 
   if ($('#server-monitor-configs').length) {
@@ -45,15 +47,6 @@ $(document).ready(function() {
 
   if ($('#active-server-monitors').length) {
     setTimeout(()=>{ loadActiveMonitors('#active-server-monitors'); }, 0);
-  }
-
-  if ($('#active-servers').length) {
-    setTimeout(()=>{ loadActiveServers('#active-servers'); }, 0);
-    setInterval(()=>{ loadActiveServers('#active-servers'); }, 1000);
-  }
-
-  if ($('#server-status').length) {
-    setInterval(()=>{ updateServerStatusBadge('#game-port', '#rcon-port'); }, server_status_interval);
   }
 
   if ($('#server-update-info').length) {
@@ -210,7 +203,7 @@ function saveMonitorConfig(name, ip, query_port, rcon_port, rcon_password) {
 }
 
 function loadServerConfigs(element) {
-  $.get('/server-configs', function(data) { $(element).html(data); });
+  $.get('/server-configs', function(data) { $(element || '#server-configs').html(data); });
 }
 
 function loadActiveServers(element) {
@@ -232,19 +225,29 @@ function loadActiveServerConfig(game_port) {
 }
 
 function loadServerConfig(name) {
-  $.get(`/server-config/${name}`, function(data) {
+  $.get(`/server-config/${encodeURIComponent(name)}`, function(data) {
     if ($('#server-status').length) {
       window.location.href = '/control';
       return;
     }
     config = JSON.parse(data);
-    $.each(config, (key, val)=>{
+    $.each(config, (key, val) => {
       console.log(`${key} => ${val}`);
+      if (key === 'server_mutators')
+      {
+        $('.server-config-mutator-input').each((i, el) => { el.checked = false });
+        $.each(val, (i, mutator) => {
+          $(`#server_mutator_${mutator}`)[0].checked = true;
+        });
+        setMutatorCount();
+        return;
+      }
       var element = $(`#${key}`)
       if (element.length) {
         if (element.hasClass('server-config-text-input')) {
           element.attr('placeholder', val);
           element.attr('previous', '');
+          element.val('');
         } else if (element.hasClass('server-config-checkbox-input')) {
           element[0].checked = val
         } else {
@@ -252,6 +255,7 @@ function loadServerConfig(name) {
         }
       }
     })
+    loadServerConfigFileContent(name);
   });
 }
 
@@ -266,15 +270,23 @@ function saveServerConfig() {
   $('.server-config-checkbox-input').each((index, element)=>{
     config[element.id] = element.checked
   });
+  var mutators = []
+  $('.server-config-mutator-input').each((index, element) =>{
+    if (element.checked) {
+      mutators.push(element.getAttribute('mutator-key'));
+    }
+  });
+  config['server_mutators'] = mutators
   var name = $('#server-config-name').val() || $('#server-config-name').attr('placeholder');
+  writeConfigFiles(name);
   $.ajax({
-    url: `/server-config/${name}`,
+    url: `/server-config/${encodeURIComponent(name)}`,
     type: 'POST',
     contentType: "application/json",
     data: JSON.stringify(config),
     success: function(message) {
       successToast(message);
-      loadServerConfigs('#server-configs');
+      loadServerConfig(name);
     },
     error: function(request,msg,error) {
       failureToast(request.responseText);
@@ -284,7 +296,7 @@ function saveServerConfig() {
 
 function deleteServerConfig(name) {
   $.ajax({
-    url: `/server-config/${name}`,
+    url: `/server-config/${encodeURIComponent(name)}`,
     type: 'DELETE',
     success: function(message) {
       successToast(message);
@@ -344,12 +356,27 @@ function saveUser(id, name, role) {
   });
 }
 
+function updateWrapper() {
+  successToast('Updating Sandstorm Admin Wrapper...');
+  $.ajax({
+    url: '/update-wrapper',
+    type: 'POST',
+    success: response => {
+      successToast(response);
+    },
+    error: (request, msg, error) => {
+      failureToast(request.responseText);
+    }
+  });
+}
+
 function restartWrapper() {
   $.ajax({
     url: '/restart-wrapper',
     type: 'POST',
-    success: function(endpoint) {
+    success: function() {
       successToast("Wrapper is restarting.");
+      setTimeout(()=>{ window.location.href = '/wrapper-config'; }, 2000);
     },
     error: function(request,msg,error) {
       failureToast(request.responseText);
@@ -413,7 +440,15 @@ function updateServerUpdateInfo() {
 function startServerLogTail(element, game_port, interval) {
   if (!server_log_active) {
     server_log_active = true;
-    $.get(`/get-buffer/${game_port}/server`, (data)=>{ server_log_uuid = data; setTimeout(()=>{tailBuffer(element, interval, data)}, 0);})
+     $.ajax({
+      url: `/get-buffer/${game_port}/server`,
+      type: 'GET',
+      success: (buffer_uuid)=>{ server_log_uuid = buffer_uuid; setTimeout(()=>{ tailBuffer(element, interval, buffer_uuid) }, 0);},
+      error: function(request,msg,error) {
+        console.log(`Failed to start server log for port ${game_port}.`);
+        server_log_active = false;
+      }
+    });
   } else {
     console.error("Server log tail already running");
   }
@@ -422,18 +457,39 @@ function startServerLogTail(element, game_port, interval) {
 function startServerRconTail(element, game_port, interval) {
   if (!server_rcon_log_active) {
     server_rcon_log_active = true;
-    $.get(`/get-buffer/${game_port}/rcon`, (data)=>{ rcon_log_uuid = data; setTimeout(()=>{tailBuffer(element, interval, data)}, 0);})
+     $.ajax({
+      url: `/get-buffer/${game_port}/rcon`,
+      type: 'GET',
+      success: (buffer_uuid)=>{ rcon_log_uuid = buffer_uuid; setTimeout(()=>{ tailBuffer(element, interval, buffer_uuid) }, 0);},
+      error: function(request,msg,error) {
+        console.log(`Failed to start rcon log for port ${game_port}.`);
+        server_rcon_log_active = false;
+      }
+    });
   } else {
     console.error("Server RCON log tail already running");
   }
 }
 
-function updatePlayers(game_port) {
+function updateServerList(element) {
+  $.ajax({
+    url: `/server-list`,
+    type: 'GET',
+    success: function(data) {
+      $(element || '#server-list').html(data);
+    },
+    error: function(request,msg,error) {
+      console.log("Failed to request server list.");
+    }
+  });
+}
+
+function updatePlayers(game_port, element) {
  $.ajax({
     url: `/players/${game_port}`,
     type: 'GET',
     success: function(data) {
-      $('#players').html(data);
+      $(element || '#players').html(data);
     },
     error: function(request,msg,error) {
       console.log("Failed to request players.");
@@ -441,12 +497,12 @@ function updatePlayers(game_port) {
   });
 }
 
-function updateThreads(game_port) {
+function updateThreads(game_port, element) {
  $.ajax({
     url: `/threads/${game_port}`,
     type: 'GET',
     success: function(data) {
-      $('#threads').html(data);
+      $(element || '#threads').html(data);
     },
     error: function(request,msg,error) {
       console.log("Failed to request threads.");
@@ -454,56 +510,66 @@ function updateThreads(game_port) {
   });
 }
 
-function updateServerStatusBadge(game_port, rcon_port) {
-  game_port = $(game_port).html();
-  rcon_port = $(rcon_port).html();
-  $.get(`/server-status/${game_port}`, function(data) {
-    if (data == 'OFF') {
-      add = 'badge-danger'
-      remove = 'badge-success'
-      if (server_log_active) {
-        server_log_active = false;
-      }
-      if (server_rcon_log_active) {
-        server_rcon_log_active = false;
-      }
-      // clearInterval(updatePlayersInterval);
-      clearInterval(updateThreadsInterval);
-      clearInterval(updateMonitoringDetailsInterval);
-      $('#monitoring-details').html('');
-      $('#threads').html('');
-      // setTimeout(() => {updatePlayers($('#game-port').html());}, 50);
-    } else {
-      add = 'badge-success'
-      remove = 'badge-danger'
-      if (!server_log_active) {
-        setTimeout(startServerLogTail('#server-log', game_port, server_log_tail_interval), 0);
-        // setTimeout(() => {updatePlayers($('#game-port').html());}, 0);
-        setTimeout(() => {updateThreads($('#game-port').html());}, 0);
-        // updatePlayersInterval = setInterval(() => {updatePlayers($('#game-port').html());}, 5000);
-        updateThreadsInterval = setInterval(() => {updateThreads($('#game-port').html());}, 5000)
-        setTimeout(() => { updateMonitoringDetails('127.0.0.1', rcon_port); }, 750);
-        updateMonitoringDetailsInterval = setInterval(() => { updateMonitoringDetails('127.0.0.1', rcon_port); }, 2000);
-      }
-      if (!server_rcon_log_active) {
-        setTimeout(startServerRconTail('#rcon-log', game_port, server_log_tail_interval), 0);
-      }
+function reloadControlStatus() {
+  $.ajax({
+    url: `/server-control-status`,
+    type: 'GET',
+    success: (response) => {
+      $('#server-control-status').html(response);
+    },
+    error: (request, msg, error) => {
+      console.log("Failed to get server control status: " + request.responseText);
     }
-    $('#server-status').addClass(add).removeClass(remove).text(data);
   });
+}
+
+function updateServerControlStatus() {
+  reloadControlStatus();
+  game_port = $('#game-port').html();
+  rcon_port = $('#rcon-port').html();
+  if ($('#server-status').html() == 'ON') {
+    if (!server_log_active && $('#server-log').length) {
+      setTimeout(()=>{startServerLogTail('#server-log', game_port, server_log_tail_interval);}, 0);
+    }
+    if (!server_rcon_log_active && $('#rcon-log').length) {
+      setTimeout(()=>{startServerRconTail('#rcon-log', game_port, server_log_tail_interval);}, 0);
+    }
+  }
+  setTimeout(()=>{updateServerControlStatus();}, 1000);
 }
 
 function addLogLines(target, lines) {
+  var target = $(target);
+  var wasScrolled = target[0].clientHeight !== target[0].scrollHeight && target[0].scrollTop !== target[0].scrollHeight - target[0].clientHeight
+
+  // Add log lines to a temporary non-visible element
+  var temp = $("<div style='display: none'>");
+  $("body").append(temp);
   $.each(lines, function(index, text) {
-    addLogLine(target, text);
+    addLogLine(temp, text);
   });
-  resetLogScroll(target);
+
+  // Trim the temp element before applying
+  if(temp.contents().length > log_buffer_size) {
+    temp.html(temp.contents().slice(temp.contents().length - log_buffer_size, temp.contents().length));
+  }
+
+  // Apply
+  target.append(temp.html());
+  temp.remove();
+  // Trim the final element after applying
+  if(target.contents().length > log_buffer_size) {
+    target.html(target.contents().slice(target.contents().length - log_buffer_size, target.contents().length));
+  }
+
+  if (!wasScrolled) {
+    resetLogScroll(target);
+  }
 }
 
-function addLogLine(target, text, reset) {
-  var el = $(target)
+function addLogLine(target, text, colorful) {
   text = _.escape(text)
-  if (el.hasClass('colorful')) {
+  if (colorful !== false) {
     if (~text.indexOf('Error')) {
       text = `<span class="logspan" style="background-color: #FFE1E0;">${text}</span>\n`;
     } else if (~text.indexOf('Warning')) {
@@ -514,15 +580,9 @@ function addLogLine(target, text, reset) {
   } else {
     text = `<span class="logspan">${text}</span>\n`;
   }
-  el.append(
+  target.append(
     text
   );
-  if(el.contents().length > log_buffer_size) {
-    el.html(el.contents().slice(el.contents().length - log_buffer_size, el.contents().length));
-  }
-  if (typeof reset !== 'undefined' && reset !== false) {
-    resetLogScroll(target);
-  }
 }
 
 function resetLogScroll(target)
@@ -571,7 +631,8 @@ function failureToast(string) {
 function copyToClipboard(element, sensitive) {
   var $temp = $("<input>");
   $("body").append($temp);
-  $temp.val($(element).text().trim()).select();
+  var text = $(element).text().trim() || $(element).val().trim() || $(element).attr('placeholder').trim()
+  $temp.val(text).select();
   document.execCommand("copy");
   if (typeof sensitive === 'undefined' || !sensitive) {
     successToast(`Successfully copied '${$temp.val()}' to clipboard!`);
@@ -649,6 +710,16 @@ function loadPreviousServerConfig() {
   }
 }
 
+function loadServerConfigFileContent(config_name) {
+  if ($('#config-files-tab-content').length) {
+    setTimeout(()=>{getConfigFileContent(config_name, '#game-ini')}, 0);
+    setTimeout(()=>{getConfigFileContent(config_name, '#engine-ini')}, 10);
+    setTimeout(()=>{getConfigFileContent(config_name, '#admins-txt')}, 20);
+    setTimeout(()=>{getConfigFileContent(config_name, '#mapcycle-txt')}, 30);
+    setTimeout(()=>{getConfigFileContent(config_name, '#bans-json')}, 40);
+  }
+}
+
 function setServerConfig(config_name, variable, value) {
   $.ajax({
       url: `/config/set?config=${encodeURIComponent(config_name)}&variable=${encodeURIComponent(variable)}&value=${encodeURIComponent(value)}`,
@@ -657,10 +728,7 @@ function setServerConfig(config_name, variable, value) {
         $(`#${variable}`).attr('previous', $(`#${variable}`).attr('placeholder'));
         if ($(`#${variable}`).is('[placeholder]')) { $(`#${variable}`).attr('placeholder', value); }
         $(`#${variable}`).val("");
-        if ($('#config-files-tab-content').length) {
-          setTimeout(getConfigFileContent(config_name, '#game-ini'), 0);
-          setTimeout(getConfigFileContent(config_name, '#engine-ini'), 0);
-        }
+        loadServerConfigFileContent(config_name);
         successToast(response);
       },
       error: function(request,msg,error) {
@@ -698,7 +766,7 @@ function getConfigFileContent(config_name, identifier) {
   var element = $(identifier);
   var file = element.attr('file');
   $.ajax({
-      url: `/config/file/${file}?config=${config_name}`,
+      url: `/config/file/${encodeURIComponent(file)}?config=${encodeURIComponent(config_name)}`,
       type: 'GET',
       success: function(response) {
         element.val(response);
@@ -711,7 +779,7 @@ function getConfigFileContent(config_name, identifier) {
 
 function serverControl(action, game_port, config_name) {
   $.ajax({
-      url: `/control/server/${action}`,
+      url: `/control/server/${encodeURIComponent(action)}`,
       type: 'POST',
       data: JSON.stringify({config_name: config_name, game_port: game_port}),
       success: function(response) {
@@ -723,8 +791,23 @@ function serverControl(action, game_port, config_name) {
   });
 }
 
-function writeConfigFile(config_name) {
-  var textarea = $('#config-files-tab-content').children('.active').first().children('textarea').first();
+function writeConfigFiles(config_name) {
+  setTimeout(
+    ()=>{
+      $('#config-files-tab-content').children().each((i, e)=>{
+        var textarea = $(e).children().first().attr('id');
+        writeConfigFile(config_name, textarea, true);
+      });
+    }
+  ,0);
+}
+
+function writeConfigFile(config_name, textarea, suppress_toasts) {
+  if (textarea) {
+    var textarea = $(`#${textarea}`);
+  } else {
+    var textarea = $('#config-files-tab-content').children('.active').first().children('textarea').first();
+  }
   var file = textarea.attr('file');
   var content = textarea.val();
   $.ajax({
@@ -732,10 +815,14 @@ function writeConfigFile(config_name) {
     type: 'POST',
     data: {'content': content},
     success: function(response) {
-      successToast(response);
+      if (!suppress_toasts) {
+        successToast(response);
+      }
     },
     error: function(request,msg,error) {
-      failureToast(request.responseText);
+      if (!suppress_toasts) {
+        failureToast(request.responseText);
+      }
     }
   });
 }
@@ -884,8 +971,26 @@ function enableAutomaticUpdates() {
   });
 }
 
-function htmlDecode(input)
-{
-  var doc = new DOMParser().parseFromString(input, "text/html");
-  return doc.documentElement.textContent;
+function setMutatorCount() {
+  var size = $('.server-config-mutator-input').filter(":checked").length;
+  $('#mutator-count').html(size);
+}
+
+function generatePassword(element) {
+  $.get('/generate-password', (password) => { $(element).val(password); });
+}
+
+function download(url) {
+  var link = document.createElement("a");
+  link.download = name;
+  link.href = url;
+  link.style.display = "none";
+
+  document.body.appendChild(link);
+  if (typeof MouseEvent !== "undefined") {
+      link.dispatchEvent(new MouseEvent("click"));
+  } else {
+      link.click();
+  }
+  document.body.removeChild(link);
 }

@@ -83,7 +83,7 @@ class ServerUpdater
 
   def run_steamcmd(command, buffer: nil, ignore_status: false, ignore_message: false)
     command.unshift @steamcmd_path
-    output = Thread.new do
+    thread = Thread.new do
       # Start a thread so we can change the environment...
       log "Running SteamCMD command: #{command}", level: :info
       SubprocessRunner.run(
@@ -92,8 +92,13 @@ class ServerUpdater
         ignore_status: ignore_status,
         ignore_message: ignore_message
       )
-    end.join
-    output = buffer[:data].join("\n") if buffer
+    end
+    thread.join
+    output = if buffer.nil?
+        thread.value
+      else
+        buffer[:data].join("\n")
+      end
     update_text = nil
     updated = ['fully installed.', 'already up to date.'].any? do |it|
       if output.include? it
@@ -112,7 +117,7 @@ class ServerUpdater
         buffer[:message] = response
       end
     end
-    response
+    [updated, response]
   end
 
   # Returns true if an update was performed, false if already up-to-date
@@ -124,9 +129,9 @@ class ServerUpdater
       "+app_update 581330#{' validate' if validate}",
       '+exit'
     ]
-    response = run_steamcmd(command, buffer: buffer, ignore_status: ignore_status, ignore_message: ignore_message)
+    updated, response = run_steamcmd(command, buffer: buffer, ignore_status: ignore_status, ignore_message: ignore_message)
     update_available?
-    response
+    [updated, response]
   end
 
   def monitor_update(minutes_between_checks: 3)
